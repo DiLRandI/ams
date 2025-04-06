@@ -1,8 +1,16 @@
 # Version information
 VERSION=dev
 
-# Declare phony targets
+# Declare phony targets	
 .PHONY: init clean build build-frontend build-all
+
+# Initialize the project
+init:
+	go mod tidy
+	go mod download
+	go mod verify
+	cd www && npm install
+	cd www && npm run build
 
 # Clean build artifacts
 clean:
