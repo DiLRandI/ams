@@ -23,7 +23,7 @@ import (
 const (
 	serviceName     = "ams-server"
 	port            = 8080
-	staticPath      = "/home/deleema/learning/ams/www/build"
+	staticPath      = "/home/deleema/learning/ams/www/dist"
 	readTimeout     = 5 * time.Second
 	writeTimeout    = 10 * time.Second
 	idleTimeout     = 120 * time.Second
