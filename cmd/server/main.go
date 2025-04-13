@@ -1,99 +1,174 @@
 package main
 
 import (
-	"encoding/json"
-	"log"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.10.0"
 )
 
-// LoginRequest represents the login request payload
-type LoginRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-}
-
-// LoginResponse represents the login response payload
-type LoginResponse struct {
-	Success bool   `json:"success"`
-	Token   string `json:"token,omitempty"`
-	Message string `json:"message,omitempty"`
-}
+const (
+	serviceName     = "ams-server"
+	port            = 8080
+	staticPath      = "/home/deleema/learning/ams/www/dist"
+	readTimeout     = 5 * time.Second
+	writeTimeout    = 10 * time.Second
+	idleTimeout     = 120 * time.Second
+	shutdownTimeout = 10 * time.Second
+)
 
 func main() {
-	// Get the absolute path to the www/build directory
-	buildDir := filepath.Join("www", "build")
-	
-	// Check if the build directory exists
-	if _, err := os.Stat(buildDir); os.IsNotExist(err) {
-		log.Fatal("React build directory not found. Please run 'npm run build' in the www directory first.")
+	// Initialize logger
+	logger := initLogger()
+	logger.Info("Starting server", "service", serviceName)
+
+	// Initialize OpenTelemetry
+	tracerProvider, err := initTracer()
+	if err != nil {
+		logger.Error("Failed to initialize tracer", "error", err)
+		os.Exit(1)
 	}
 
-	// Create a file server handler
-	fs := http.FileServer(http.Dir(buildDir))
-
-	// Handle login endpoint
-	http.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST method
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
+	// Ensure tracer is shutdown properly
+	defer func() {
+		if err := tracerProvider.Shutdown(context.Background()); err != nil {
+			logger.Error("Error shutting down tracer provider", "error", err)
 		}
+	}()
 
-		// Parse request body
-		var loginReq LoginRequest
-		if err := json.NewDecoder(r.Body).Decode(&loginReq); err != nil {
-			http.Error(w, "Invalid request body", http.StatusBadRequest)
-			return
-		}
+	// Create HTTP server with routes
+	mux := http.NewServeMux()
 
-		// Hardcoded credentials check
-		if loginReq.Email == "admin" && loginReq.Password == "admin" {
-			// Successful login
-			response := LoginResponse{
-				Success: true,
-				Token:   "dummy-token-123", // In a real app, this would be a JWT or similar
-				Message: "Login successful",
-			}
-			
-			w.Header().Set("Content-Type", "application/json")
+	// Health check endpoint
+	mux.Handle("GET /health", otelhttp.NewHandler(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(response)
-			log.Printf("Login successful for user: %s", loginReq.Email)
-		} else {
-			// Failed login
-			response := LoginResponse{
-				Success: false,
-				Message: "Invalid credentials",
+			if _, err := w.Write([]byte("OK")); err != nil {
+				logger.Error("Failed to write response", "error", err)
 			}
-			
+		}),
+		"health",
+		otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
+	))
+
+	// API endpoints can be added here
+	mux.Handle("GET /api/status", otelhttp.NewHandler(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(response)
-			log.Printf("Login failed for user: %s", loginReq.Email)
-		}
-	})
+			if _, err := w.Write([]byte(`{"status":"running"}`)); err != nil {
+				logger.Error("Failed to write response", "error", err)
+			}
+		}),
+		"api-status",
+		otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
+	))
 
-	// Handle all routes
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Try to serve the requested file
-		_, err := os.Stat(filepath.Join(buildDir, r.URL.Path))
-		if os.IsNotExist(err) {
-			// If the file doesn't exist, serve index.html for client-side routing
-			log.Printf("Route not found: %s, serving index.html for client-side routing", r.URL.Path)
-			http.ServeFile(w, r, filepath.Join(buildDir, "index.html"))
-			return
-		}
-		log.Printf("Serving file: %s", r.URL.Path)
+	// Serve static files with OTEL instrumentation
+	fs := http.FileServer(http.Dir(staticPath))
+	mux.Handle("GET /", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		logger.Info("Serving file", "path", r.URL.Path)
 		fs.ServeHTTP(w, r)
-	})
+	}))
 
-	// Start the server
-	port := ":8080"
-	log.Printf("Server starting on http://localhost%s", port)
-	if err := http.ListenAndServe(port, nil); err != nil {
-		log.Fatal(err)
+	// Configure the HTTP server with required fields
+	server := &http.Server{
+		Addr:              fmt.Sprintf(":%d", port),
+		Handler:           otelhttp.NewHandler(mux, serviceName),
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		ReadHeaderTimeout: 2 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1MB
+		ErrorLog:          slog.NewLogLogger(slog.Default().Handler(), slog.LevelError),
 	}
+
+	// Start server in a goroutine
+	go func() {
+		logger.Info("Server listening", "port", port)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("Server failed", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	// Graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	logger.Info("Shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		logger.Error("Server forced to shutdown", "error", err)
+		// Do not call os.Exit here to ensure deferred functions run
+	}
+
+	logger.Info("Server exiting")
 }
-	
+
+func initLogger() *slog.Logger {
+	// Create a structured logger with OpenTelemetry compatible fields
+	opts := &slog.HandlerOptions{
+		Level:     slog.LevelInfo,
+		AddSource: true,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			// Could customize attribute handling here for OTEL
+			return a
+		},
+	}
+
+	handler := slog.NewJSONHandler(os.Stdout, opts)
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
+
+	return logger
+}
+
+func initTracer() (*sdktrace.TracerProvider, error) {
+	// Create stdout exporter to send traces to stdout
+	exporter, err := stdouttrace.New(stdouttrace.WithPrettyPrint())
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stdout exporter: %w", err)
+	}
+
+	// Create a resource describing this service
+	res, err := resource.New(context.Background(),
+		resource.WithAttributes(
+			semconv.ServiceNameKey.String(serviceName),
+			semconv.ServiceVersionKey.String("v0.1.0"),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create resource: %w", err)
+	}
+
+	// Create a TracerProvider with the exporter
+	tracerProvider := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+	)
+	otel.SetTracerProvider(tracerProvider)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
+	return tracerProvider, nil
+}
