@@ -1,20 +1,44 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import './App.css'
-import Login from './components/Login'
-import Dashboard from './components/Dashboard'
+import LoginPage from './features/auth/pages/LoginPage'
+import DashboardPage from './features/dashboard/pages/DashboardPage'
 import MainLayout from './layouts/MainLayout'
+import * as authService from './features/auth/services/authService'
 
 function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false)
+  const [userProfile, setUserProfile] = useState(null)
+
+  // Check if user is already logged in on component mount
+  useEffect(() => {
+    if (authService.isTokenValid()) {
+      const storedProfile = authService.getStoredProfile()
+      if (storedProfile) {
+        setUserProfile(storedProfile)
+        setIsLoggedIn(true)
+      }
+    }
+  }, [])
+
+  const handleLoginSuccess = (profile) => {
+    setUserProfile(profile)
+    setIsLoggedIn(true)
+  }
+
+  const handleLogout = () => {
+    authService.logout()
+    setUserProfile(null)
+    setIsLoggedIn(false)
+  }
 
   return (
     <>
       {isLoggedIn ? (
-        <MainLayout onLogout={() => setIsLoggedIn(false)}>
-          <Dashboard />
+        <MainLayout onLogout={handleLogout} userProfile={userProfile}>
+          <DashboardPage />
         </MainLayout>
       ) : (
-        <Login onLoginSuccess={() => setIsLoggedIn(true)} />
+        <LoginPage onLoginSuccess={handleLoginSuccess} />
       )}
     </>
   )
