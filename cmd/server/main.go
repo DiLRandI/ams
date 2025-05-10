@@ -11,6 +11,9 @@ import (
 	"syscall"
 	"time"
 
+	"ams/internal/app"
+	"ams/internal/logger"
+
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
@@ -23,7 +26,6 @@ import (
 const (
 	serviceName     = "ams-server"
 	port            = 8080
-	staticPath      = "/home/deleema/learning/ams/www/dist"
 	readTimeout     = 5 * time.Second
 	writeTimeout    = 10 * time.Second
 	idleTimeout     = 120 * time.Second
@@ -32,56 +34,30 @@ const (
 
 func main() {
 	// Initialize logger
-	logger := initLogger()
+	logger := logger.InitLogger()
 	logger.Info("Starting server", "service", serviceName)
 
-	// Initialize OpenTelemetry
 	tracerProvider, err := initTracer()
 	if err != nil {
 		logger.Error("Failed to initialize tracer", "error", err)
 		os.Exit(1)
 	}
 
-	// Ensure tracer is shutdown properly
 	defer func() {
 		if err := tracerProvider.Shutdown(context.Background()); err != nil {
 			logger.Error("Error shutting down tracer provider", "error", err)
 		}
 	}()
 
-	// Create HTTP server with routes
+	app := app.New(&app.Config{
+		WebRootPath: "web",
+	})
+
 	mux := http.NewServeMux()
-
-	// Health check endpoint
-	mux.Handle("GET /health", otelhttp.NewHandler(
-		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			if _, err := w.Write([]byte("OK")); err != nil {
-				logger.Error("Failed to write response", "error", err)
-			}
-		}),
-		"health",
-		otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
-	))
-
-	// API endpoints can be added here
-	mux.Handle("GET /api/status", otelhttp.NewHandler(
-		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			if _, err := w.Write([]byte(`{"status":"running"}`)); err != nil {
-				logger.Error("Failed to write response", "error", err)
-			}
-		}),
-		"api-status",
-		otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
-	))
-
-	// Serve static files with OTEL instrumentation
-	fs := http.FileServer(http.Dir(staticPath))
-	mux.Handle("GET /", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		logger.Info("Serving file", "path", r.URL.Path)
-		fs.ServeHTTP(w, r)
-	}))
+	if err := app.InitRoutes(mux); err != nil {
+		logger.Error("Failed to initialize routes", "error", err)
+		os.Exit(1)
+	}
 
 	// Configure the HTTP server with required fields
 	server := &http.Server{
@@ -120,24 +96,6 @@ func main() {
 	}
 
 	logger.Info("Server exiting")
-}
-
-func initLogger() *slog.Logger {
-	// Create a structured logger with OpenTelemetry compatible fields
-	opts := &slog.HandlerOptions{
-		Level:     slog.LevelInfo,
-		AddSource: true,
-		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			// Could customize attribute handling here for OTEL
-			return a
-		},
-	}
-
-	handler := slog.NewJSONHandler(os.Stdout, opts)
-	logger := slog.New(handler)
-	slog.SetDefault(logger)
-
-	return logger
 }
 
 func initTracer() (*sdktrace.TracerProvider, error) {
